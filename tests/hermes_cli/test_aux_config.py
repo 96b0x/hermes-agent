@@ -116,3 +116,22 @@ def test_delegation_cfg_as_task_projection():
     assert _format_aux_current(shaped) == "nous · Hermes-4.5"
     # Non-dict delegation section must not crash
     assert _format_aux_current(_delegation_cfg_as_task({"delegation": "bogus"})) == "auto"
+
+
+def test_memory_context_route_round_trips_without_dropping_other_tasks(tmp_path, monkeypatch):
+    from hermes_cli.main_provider_setup import _AUX_TASKS
+
+    _isolate_home(tmp_path, monkeypatch)
+    before = load_config()["auxiliary"]
+    _save_aux_choice("memory_context", provider="openrouter", model="memory-compiler")
+    after = load_config()["auxiliary"]
+
+    assert after["memory_context"]["model"] == "memory-compiler"
+    assert any(task[0] == "memory_context" for task in _AUX_TASKS)
+    for task, config in before.items():
+        if task != "memory_context":
+            assert after[task] == config
+    _reset_aux_to_auto()
+    reset = load_config()["auxiliary"]["memory_context"]
+    assert reset["provider"] == "auto"
+    assert reset["timeout"] == before["memory_context"]["timeout"]

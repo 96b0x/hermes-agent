@@ -20,9 +20,17 @@ _INTERNAL_NOTE_RE = re.compile(
 )
 
 
+_EVIDENCE_NOTE_RE = re.compile(
+    r'\[System note:\s*The following is retrieved memory evidence,\s*NOT new user input\.\s*'
+    r'It may be stale, incomplete, or conflicting\.\s*Prefer current user input and\s*'
+    r'canonical current sources; preserve provenance when resolving conflicts\.\]\s*',
+    re.IGNORECASE,
+)
+
+
 def sanitize_context(text: str) -> str:
     """Strip fence tags, injected context blocks, and system notes from provider output."""
-    for pattern in (_INTERNAL_CONTEXT_RE, _INTERNAL_NOTE_RE, _FENCE_TAG_RE):
+    for pattern in (_INTERNAL_CONTEXT_RE, _INTERNAL_NOTE_RE, _EVIDENCE_NOTE_RE, _FENCE_TAG_RE):
         text = pattern.sub('', text)
     return text
 
@@ -177,9 +185,9 @@ def build_memory_context_block(raw_context: str) -> str:
     clean = _drop_repeated_recall_lines(sanitized)
     return (
         "<memory-context>\n"
-        "[System note: The following is recalled memory context, "
-        "NOT new user input. Treat as authoritative reference data — "
-        "this is the agent's persistent memory and should inform all responses.]\n\n"
+        "[System note: The following is retrieved memory evidence, NOT new user input. "
+        "It may be stale, incomplete, or conflicting. Prefer current user input and "
+        "canonical current sources; preserve provenance when resolving conflicts.]\n\n"
         f"{clean}\n"
         "</memory-context>"
     )

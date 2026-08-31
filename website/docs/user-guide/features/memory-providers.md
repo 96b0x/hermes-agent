@@ -13,8 +13,28 @@ Hermes Agent ships with 2 external memory provider plugins (RetainDB and ByteRov
 ```bash
 hermes memory setup      # interactive picker + configuration
 hermes memory status     # check what's active
+hermes memory use mem0   # reactivate an already-configured provider
+hermes memory use builtin # built-in only; external state stays intact
 hermes memory off        # disable external provider
 ```
+
+Switching with `hermes memory use` changes only the active-provider selector.
+Each provider's native configuration and persisted database remain untouched,
+so you can switch away and later resume the same state. Start a new session
+after switching; provider tools and prompt context are fixed for a conversation.
+
+Providers can opt into a bounded prior-dialogue window for current-turn recall.
+Hermes passes the current query separately, redacts provider-bound text, and
+injects returned evidence into the current user message without changing the
+conversation's system prompt. Slow synchronous providers can declare a larger
+`prefetch_timeout_seconds` budget. `memory.context_timeout_seconds` sets the
+host baseline (8 seconds when unset); the larger valid budget applies.
+Timeouts fail open and late results are discarded by the host.
+
+Providers that compile retrieved evidence can route that work with
+`auxiliary.memory_context` (`provider`, `model`, `timeout`, and
+`reasoning_effort`), also available under `hermes model` → auxiliary tasks.
+This config does not itself enable a provider's compiler.
 
 You can also select the active memory provider via `hermes plugins` → Provider Plugins → Memory Provider.
 
@@ -32,7 +52,7 @@ memory:
 When a memory provider is active, Hermes automatically:
 
 1. **Injects provider context** into the system prompt (what the provider knows)
-2. **Prefetches relevant memories** before each turn (background, non-blocking)
+2. **Prepares relevant memories** before each turn (cached or synchronous, depending on the provider)
 3. **Syncs conversation turns** to the provider after each response
 4. **Extracts memories on session end** (for providers that support it)
 5. **Mirrors built-in memory writes** to the external provider
@@ -531,6 +551,12 @@ The plugin lands in `~/.hermes/plugins/hindsight/` (per profile home). A memory 
 | `recall_tags` | — | Tags to filter on recall |
 
 See the [upstream Hermes integration docs](https://hindsight.vectorize.io/sdks/integrations/hermes) for the full configuration reference.
+
+The custom current-turn compiler and its `recall_sync`, `context_compiler`, and
+`recall_max_input_chars` settings belong to the external Hindsight integration.
+They are not bundled with Hermes; use a plugin version that implements them.
+Provider-specific setup runs through `hermes memory setup hindsight` and the
+plugin's `post_setup` hook or its own registered CLI command.
 
 #### Migrating from bundled Hindsight
 

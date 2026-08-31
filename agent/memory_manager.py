@@ -10,6 +10,7 @@ import contextvars
 import inspect
 import json
 import logging
+import math
 import re
 import threading
 import time
@@ -55,6 +56,24 @@ _PROBE_INTERVAL_S = 60.0
 # Hard cap on calls in flight per (home, provider), orphans included: failed probes pin one more thread
 # each, so admission (probes too) stops here and a backend that stays wedged pins a bounded number.
 _MAX_INFLIGHT_CALLS = 16
+_PREFETCH_HISTORY_MESSAGES = 8
+_PREFETCH_HISTORY_CHARS = 8000
+
+
+def resolve_memory_context_timeout(mem_config: Optional[dict[str, Any]]) -> float:
+    """Resolve the fail-open external memory preparation timeout."""
+    config = mem_config or {}
+    default = _EXTERNAL_PREFETCH_TIMEOUT_S
+    try:
+        value = config.get("context_timeout_seconds")
+        if value is None:
+            return default
+        timeout = float(value)
+        if math.isfinite(timeout) and timeout > 0:
+            return timeout
+    except (TypeError, ValueError):
+        pass
+    return default
 
 
 # -- Signature introspection (providers are duck-typed; call shapes vary) -----
@@ -213,11 +232,13 @@ class MemoryManager:
         self._has_external: bool = False
         timeout = external_prefetch_timeout
         timeout = _EXTERNAL_PREFETCH_TIMEOUT_S if timeout is None else float(timeout)
-        if timeout <= 0:
+        if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("external_prefetch_timeout must be positive")
         self._external_prefetch_timeout = timeout
         # Captured at build time, inside the profile scope the agent is built for.
         self._home_key = hermes_home_key()
+        self._external_prefetch_lock = threading.Lock()
+        self._prefetch_generation = 0
         # Single-worker background executor for end-of-turn sync/prefetch, created lazily so
         # the builtin-only path spawns no threads; one worker serializes a provider's writes.
         self._sync_executor: Optional[ThreadPoolExecutor] = None
@@ -343,22 +364,121 @@ class MemoryManager:
     # providers get just the user's instruction (None for a bare invocation).
     _strip_skill_scaffolding = staticmethod(extract_user_instruction_from_skill_message)
 
-    def prefetch_all(self, query: str, *, session_id: str = "") -> str:
+    def _invalidate_prefetch(self) -> int:
+        """Detach prior-turn/session results without trying to cancel provider I/O."""
+        with self._external_prefetch_lock:
+            self._prefetch_generation += 1
+            return self._prefetch_generation
+
+    @staticmethod
+    def _provider_prefetch_accepts_messages(provider: MemoryProvider) -> bool:
+        """Return whether prefetch accepts the optional messages keyword."""
+        try:
+            signature = inspect.signature(provider.prefetch)
+        except (TypeError, ValueError):
+            # Signature failure is not an opt-in signal. Stay compatible with
+            # opaque/native third-party providers by using the old call shape.
+            return False
+        params = list(signature.parameters.values())
+        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params):
+            return True
+        return (getattr(signature.parameters.get("messages"), "kind", None)
+                in (inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD))
+
+    @classmethod
+    def _clean_prefetch_messages(
+        cls, messages: Optional[list[dict[str, Any]]]
+    ) -> Optional[list[dict[str, str]]]:
+        """Return a bounded clean dialogue window for context-aware recall."""
+        if not messages:
+            return None
+        candidates: list[dict[str, str]] = []
+        for message in messages[-_PREFETCH_HISTORY_MESSAGES:]:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "").strip().lower()
+            content = message.get("content")
+            if role not in {"user", "assistant"} or not isinstance(content, str):
+                continue
+            if role == "user":
+                content = cls._strip_skill_scaffolding(content)
+                if not content:
+                    continue
+            content = sanitize_context(content).strip()
+            if content:
+                candidates.append({"role": role, "content": content})
+
+        # Bound both message count and characters handed to opted-in providers.
+        # Keep the newest dialogue under pressure while preserving both ends
+        # of the boundary message instead of taking a blind tail slice.
+        remaining = _PREFETCH_HISTORY_CHARS
+        clean_reversed: list[dict[str, str]] = []
+        marker = "\n[... prior message truncated ...]\n"
+        for message in reversed(candidates):
+            if remaining <= 0:
+                break
+            content = message["content"]
+            if len(content) > remaining:
+                if remaining <= len(marker):
+                    content = content[-remaining:]
+                else:
+                    available = remaining - len(marker)
+                    head = max(1, int(available * 0.65))
+                    tail = available - head
+                    tail_text = content[-tail:].lstrip() if tail else ""
+                    content = content[:head].rstrip() + marker + tail_text
+            clean_reversed.append({"role": message["role"], "content": content})
+            remaining -= len(content)
+        return list(reversed(clean_reversed)) or None
+
+    def prefetch_all(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+        messages: Optional[list[dict[str, Any]]] = None,
+    ) -> str:
         """Merge non-empty prefetch context from all providers (failures are non-fatal)."""
-        clean_query = self._strip_skill_scaffolding(query)
-        if not clean_query or not self._owner_allows("prefetch"):
+        if not self._owner_allows("prefetch"):
             return ""
-        clean_query = _redact_for_provider(clean_query)
+        generation = self._invalidate_prefetch()
+        clean_query = self._strip_skill_scaffolding(query)
+        if not clean_query:
+            return ""
+        # Scrub before filtering: tool output may identify a secret later echoed in dialogue.
+        clean_query, redacted_messages = _redact_for_provider(clean_query, messages)
+        clean_messages = self._clean_prefetch_messages(redacted_messages)
         parts = self._each_provider(
-            "prefetch failed (non-fatal)", lambda p: self._prefetch_provider(p, clean_query, session_id=session_id),
+            "prefetch failed (non-fatal)",
+            lambda p: self._prefetch_provider(
+                p,
+                clean_query,
+                session_id=session_id,
+                messages=clean_messages,
+                _generation=generation,
+            ),
         )
+        with self._external_prefetch_lock:
+            if generation != self._prefetch_generation:
+                return ""
         return "\n\n".join(p for p in parts if p and p.strip())
 
-    def _prefetch_provider(self, provider: MemoryProvider, query: str, *, session_id: str = "") -> str:
+    def _prefetch_provider(
+        self,
+        provider: MemoryProvider,
+        query: str,
+        *,
+        session_id: str = "",
+        messages: Optional[list[dict[str, str]]] = None,
+        _generation: Optional[int] = None,
+    ) -> str:
         """Run one provider's prefetch; external providers are bounded by a timeout. A stuck external
         call keeps running on its daemon thread; _PREFETCH_GATE decides whether later turns call again."""
+        kwargs: dict[str, Any] = {"session_id": session_id}
+        if messages is not None and self._provider_prefetch_accepts_messages(provider):
+            kwargs["messages"] = messages
         if provider.name == "builtin":
-            return provider.prefetch(query, session_id=session_id)
+            return provider.prefetch(query, **kwargs)
 
         result_box: dict[str, Any] = {}
 
@@ -366,14 +486,22 @@ class MemoryManager:
 
         def _run() -> None:
             try:
-                result_box["value"] = provider.prefetch(query, session_id=session_id) or ""
+                result_box["value"] = provider.prefetch(query, **kwargs) or ""
             except Exception as exc:  # pragma: no cover - re-raised by caller
                 result_box["error"] = exc
             finally:
                 self._PREFETCH_GATE.leave(key, thread, ok="error" not in result_box)
 
         thread = spawn_context_thread(_run, name=f"memory-prefetch-{provider.name}")
-        skipped = self._PREFETCH_GATE.enter(key, thread, self._external_prefetch_timeout)
+        timeout = self._external_prefetch_timeout
+        requested = getattr(provider, "prefetch_timeout_seconds", None)
+        if isinstance(requested, (int, float)) and not isinstance(requested, bool) and math.isfinite(requested) and requested > 0:
+            timeout = max(timeout, float(requested))
+        with self._external_prefetch_lock:
+            if _generation is not None and _generation != self._prefetch_generation:
+                return ""
+            generation = self._prefetch_generation
+            skipped = self._PREFETCH_GATE.enter(key, thread, timeout)
         if skipped:
             logger.debug("Memory provider '%s' prefetch skipped (%d stuck, %d in flight)",
                          provider.name, *skipped[:2])
@@ -385,15 +513,18 @@ class MemoryManager:
             self._PREFETCH_GATE.leave(key, thread, ok=False)
             raise
 
-        thread.join(self._external_prefetch_timeout)
+        thread.join(timeout)
         if thread.is_alive():
             logger.warning(
                 "Memory provider '%s' prefetch timed out after %.1fs; the call keeps running in the "
                 "background (later turns may skip it while the provider stays stuck)", provider.name,
-                self._external_prefetch_timeout,
+                timeout,
             )
             return ""
 
+        with self._external_prefetch_lock:
+            if generation != self._prefetch_generation:
+                return ""
         if "error" in result_box:
             raise result_box["error"]
         result = result_box.get("value", "")
@@ -613,6 +744,7 @@ class MemoryManager:
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         if not self._owner_allows("on_turn_start"):
             return
+        self._invalidate_prefetch()
         message = _redact_for_provider(message)
 
         def _tick(p: MemoryProvider) -> None:
@@ -649,6 +781,7 @@ class MemoryManager:
         """
         if not self._providers or not self._owner_allows("session_boundary"):
             return
+        self._invalidate_prefetch()
         snapshot = list(messages or [])
 
         def _run() -> None:  # both hooks already guard per-provider
@@ -670,6 +803,7 @@ class MemoryManager:
         (``/undo``): same id, truncated transcript."""
         if not new_session_id or not self._owner_allows("on_session_switch"):
             return
+        self._invalidate_prefetch()
         if rewound:  # forward only when set so it never pollutes providers' **kwargs
             kwargs["rewound"] = True
         self._each_provider(
@@ -857,6 +991,7 @@ class MemoryManager:
 
     def shutdown_all(self) -> None:
         """Drain the background executor (bounded), then shut providers down in reverse order."""
+        self._invalidate_prefetch()
         self._drain_sync_executor()
         self._each_provider("shutdown failed", lambda p: p.shutdown(), level=logging.WARNING,
                             providers=self._providers[::-1])

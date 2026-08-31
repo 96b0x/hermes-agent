@@ -908,6 +908,7 @@ def _memory_query_text(original_user_message: Any) -> str:
 
 def _memory_turn_start_and_prefetch(
     agent: Any, original_user_message: Any, turn_author: Optional[dict[str, Any]] = None,
+    *, messages: Optional[list[Any]] = None, current_turn_user_idx: Optional[int] = None,
 ) -> str:
     """Notify memory providers of the new turn, then prefetch external memory once
     before the tool loop (skipped on trivial prompts with no semantic signal).
@@ -926,7 +927,12 @@ def _memory_turn_start_and_prefetch(
     ext_prefetch_cache = ""
     with suppress(Exception):
         if not is_trivial_prompt(_query):
-            ext_prefetch_cache = agent._memory_manager.prefetch_all(_query, session_id=agent.session_id) or ""
+            prior_messages = None
+            if messages is not None and current_turn_user_idx is not None:
+                prior_messages = messages[:current_turn_user_idx]
+            ext_prefetch_cache = agent._memory_manager.prefetch_all(
+                _query, session_id=agent.session_id, messages=prior_messages,
+            ) or ""
     # Deterministic recall indicator via _emit_status so the model can't silently
     # drop injected memory.
     if ext_prefetch_cache:
@@ -1192,7 +1198,10 @@ def build_turn_context(
     )
 
     _bind_interrupt_scope(agent, ra)
-    ext_prefetch_cache = _memory_turn_start_and_prefetch(agent, original_user_message, turn_author)
+    ext_prefetch_cache = _memory_turn_start_and_prefetch(
+        agent, original_user_message, turn_author,
+        messages=messages, current_turn_user_idx=current_turn_user_idx,
+    )
 
     # Title the session now: titling depends only on the user's ask (before any injected
     # context lands on list content), so it runs concurrently with the turn. Daemon thread,

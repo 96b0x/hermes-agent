@@ -32,6 +32,22 @@ def spawn_context_thread(target: Callable[..., Any], *, name: str, daemon: bool 
     Every memory-provider background job (prefetch, sync, writer loops) must go through this."""
     return threading.Thread(target=ctx_bound(target), args=args, kwargs=kwargs, name=name, daemon=daemon)
 
+
+def call_auxiliary_task(
+    task: str, *, messages: list[dict[str, Any]], temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None, timeout: Optional[float] = None,
+) -> Any:
+    """Run a provider's non-streaming side-model task through Hermes routing and hooks.
+
+    Uses ``auxiliary.<task>`` in the owning profile. Returns the completion object;
+    errors propagate so the provider can fall back to its ranked evidence. Call under
+    the lifecycle callback's scope, or from a :func:`spawn_context_thread` worker.
+    """
+    from agent.auxiliary_client import call_llm
+
+    return call_llm(task=task, messages=messages, temperature=temperature,
+                    max_tokens=max_tokens, timeout=timeout)
+
 # v1 = best-effort on_pre_compress() with the raw message list; v2 = opt-in fail-closed
 # checkpoint (normalized evidence handoff + strict-mode failure propagation).
 PRE_COMPRESS_CHECKPOINT_API_VERSION = 2
@@ -135,9 +151,36 @@ class MemoryProvider(ABC):
         """STATIC system-prompt text; "" to skip. Recalled context goes through prefetch(), not here."""
         return ""
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
-        """Formatted recall context for the upcoming turn ("" if none). Must be fast — recall
-        in the background and return cached results; ``session_id`` scopes concurrent sessions."""
+    @property
+    def prefetch_timeout_seconds(self) -> Optional[float]:
+        """Optional finite positive recall budget; the host uses the larger of this and its default."""
+        return None
+
+    def prefetch(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+        messages: Optional[list[dict[str, str]]] = None,
+    ) -> str:
+        """Recall relevant context for the upcoming turn.
+
+        Called once before the tool loop for a substantive user turn. Return formatted text to inject as
+        context, or empty string if nothing relevant. Implementations
+        may serve a fast cached result or synchronously retrieve current-turn
+        evidence. Synchronous providers should declare prefetch_timeout_seconds
+        so their bounded API/compilation pipeline is not cut off by the fast-cache
+        manager deadline.
+
+        session_id is provided for providers serving concurrent sessions
+        (gateway group chats, cached agents). Providers that don't need
+        per-session scoping can ignore it.
+
+        ``messages`` is an optional bounded, clean user/assistant dialogue
+        window preceding the current query. MemoryManager only passes it to
+        providers whose signature opts in, preserving compatibility with
+        third-party providers written against the historical contract.
+        """
         return ""
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:

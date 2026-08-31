@@ -259,7 +259,7 @@ def test_prefetch_runs_for_substantive_user_message():
     agent, mm = _agent_with_memory_manager()
     query = "what did we decide about the deploy pipeline?"
     ctx = _build(agent, user_message=query)
-    mm.prefetch_all.assert_called_once_with(query, session_id=agent.session_id)
+    mm.prefetch_all.assert_called_once_with(query, session_id=agent.session_id, messages=[])
     assert ctx.ext_prefetch_cache == "REMEMBERED CONTEXT"
 
 
@@ -314,6 +314,28 @@ def test_turn_author_reaches_the_agent_through_the_real_facade(monkeypatch):
     assert agent._turn_author == {"id": "bot:alpha", "name": "Alpha", "is_bot": True}
     agent.run_conversation("hi again")
     assert agent._turn_author is None
+
+
+def test_prefetch_receives_prior_dialogue_but_not_current_turn():
+    agent, mm = _agent_with_memory_manager()
+    history = [
+        {"role": "user", "content": "Explain the Hindsight pipeline."},
+        {"role": "assistant", "content": "It used next-turn prefetch."},
+    ]
+
+    _build(
+        agent,
+        user_message="Why is it designed that way?",
+        conversation_history=history,
+    )
+
+    call = mm.prefetch_all.call_args
+    assert call.args == ("Why is it designed that way?",)
+    assert call.kwargs["session_id"] == "sess-1"
+    assert [message["content"] for message in call.kwargs["messages"]] == [
+        "Explain the Hindsight pipeline.",
+        "It used next-turn prefetch.",
+    ]
 
 
 def test_turn_start_replaces_stale_parent_history_with_compression_child():

@@ -23,6 +23,12 @@ def build_memory_parser(subparsers, *, cmd_memory: Callable) -> None:
     _setup_parser.add_argument(
         "provider", nargs="?", default=None,
         help="Provider to configure directly (e.g. honcho), skipping the picker")
+    use_parser = memory_sub.add_parser(
+        "use", help="Switch to an already-configured provider, preserving its state")
+    use_parser.add_argument("provider", help="Provider name, or 'builtin' for built-in memory only")
+    use_parser.add_argument(
+        "--force", action="store_true",
+        help="Select an installed provider even when its requirements are unavailable")
     memory_sub.add_parser("status", help="Show current memory provider config")
     memory_sub.add_parser("off", help="Disable external provider (built-in only)")
     _reset_parser = memory_sub.add_parser(
