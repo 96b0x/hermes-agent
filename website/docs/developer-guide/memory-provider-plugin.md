@@ -171,7 +171,7 @@ workspace; absent or empty cwd remains unpinned.
 | Method | When Called | Use Case |
 |--------|-----------|----------|
 | `system_prompt_block()` | System prompt assembly | Static provider info |
-| `prefetch(query, *, session_id="")` | Before each API call | Return recalled context |
+| `prefetch(query, *, session_id="", messages=None)` | Once before the tool loop on substantive turns | Return recalled context |
 | `queue_prefetch(query, *, session_id="")` | After each turn | Pre-warm for next turn |
 | `sync_turn(user, assistant, *, session_id="", messages=None)` | After each completed turn | Persist conversation |
 | `on_session_end(messages)` | Conversation ends | Final extraction/flush |
@@ -186,6 +186,61 @@ each operation's previous content reflects earlier operations in that batch.
 `old_text` is the caller's search text, not the identity of the changed entry.
 Older Hermes versions can omit `previous_content`. Providers that require exact
 identity should skip destructive mirroring when it is absent.
+
+### Current-turn context and auxiliary compilation
+
+The host supplies the current query separately from `messages`, a window from
+before the current user row. Only callbacks declaring a keyword-compatible
+`messages` parameter or `**kwargs` receive it; legacy callbacks keep their old
+call shape. The manager redacts query and history together before selecting up
+to the last eight rows, retaining only string user/assistant content, removing
+skill scaffolding and prior memory fences, and bounding total content to 8,000
+characters. Newest dialogue wins under pressure. It does not forward system or
+tool rows, API sidecars, or attachment payloads in this window.
+
+`on_turn_start` receives the normalized current author as `author_id`,
+`author_name`, and `author_is_bot`, where accepted by the callback signature.
+`sync_turn` can additionally opt into `turn_author={"id", "name", "is_bot"}`.
+Do not assume the session opener wrote every turn in a shared conversation.
+
+An external provider can override the `prefetch_timeout_seconds` property with
+a finite positive number. The host waits for the larger of that number and
+`memory.context_timeout_seconds` (8 seconds when unset); invalid provider
+budgets fall back to the host value. The thread remains alive after a timeout,
+and the host skips further calls to that provider until it exits. Its late
+return is discarded. Session switches, rewinds, new turns, queued session
+boundaries, and shutdown invalidate pending host results.
+
+Provider-owned background caches need their own session/generation fence:
+capture the session and generation before starting I/O, publish only if both
+still match, and invalidate on `on_session_switch` (including `rewound=True`)
+and shutdown. The host cannot cancel provider I/O or undo writes to its cache.
+Use `spawn_context_thread` or `ctx_bound` from `agent.memory_provider` to carry
+the owning profile and secret scope into workers; never fall back to launch
+profile environment variables.
+
+For an evidence compiler, use the public helper:
+
+```python
+from agent.memory_provider import call_auxiliary_task
+
+response = call_auxiliary_task(
+    "memory_context",
+    messages=[{"role": "user", "content": "Select retrieved evidence IDs"}],
+    temperature=0,
+    max_tokens=1200,
+    timeout=None,
+)
+```
+
+Signature: `call_auxiliary_task(task: str, *, messages: list[dict[str, Any]],
+temperature: Optional[float] = None, max_tokens: Optional[int] = None,
+timeout: Optional[float] = None) -> Any`. It returns a non-streaming completion
+object unchanged and propagates exceptions. The task's profile-scoped routing,
+reasoning, timeout, concurrency, and auxiliary observer hooks remain owned by
+Hermes. `None` uses the configured task timeout. Validate selections and render
+original evidence in the plugin; on invalid output, fall back to ranked recall.
+The compiler must not mutate past messages, tools, or the cached system prompt.
 
 ### Oversized prefetch results
 

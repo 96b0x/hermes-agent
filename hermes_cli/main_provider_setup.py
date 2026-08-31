@@ -58,6 +58,7 @@ _AUX_TASKS: list[tuple[str, str, str]] = [
     ("title_generation", "Title generation", "session titles"),
     ("review", "Review", "/review reviewer subagent"),
     ("memory_query_rewrite", "Memory query rewrite", "memory retrieval queries"),
+    ("memory_context", "Memory context", "memory context compilation"),
     ("tts_audio_tags", "TTS audio tags", "Gemini TTS tag insertion"),
     ("voice_chat", "Voice chat", "spoken voice-mode replies"),
     ("skills_hub", "Skills hub", "skills search/install"),
