@@ -33,6 +33,7 @@ from plugins.memory.hindsight import (
     _resolve_bank_id_template,
     _sanitize_bank_segment,
 )
+from plugins.memory.hindsight.context_compiler import CompiledMemoryContext
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +173,8 @@ def provider(tmp_path, monkeypatch):
         "bank_id": "test-bank",
         "budget": "mid",
         "memory_mode": "hybrid",
+        # Most historical provider tests exercise legacy queued prefetch.
+        "recall_sync": False,
     }
     config_path = tmp_path / "hindsight" / "config.json"
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -261,7 +264,7 @@ class TestConfig:
         assert provider._auto_recall is True
         assert provider._retain_every_n_turns == 1
         assert provider._recall_max_tokens == 4096
-        assert provider._recall_max_input_chars == 800
+        assert provider._recall_max_input_chars == 4000
         assert provider._tags is None
         assert provider._observation_scopes is None
         assert provider._recall_tags is None
@@ -553,15 +556,14 @@ class TestToolHandlers:
 
 class TestPrefetch:
     def test_prefetch_returns_empty_when_no_result(self, provider):
+        provider._client.arecall.return_value = SimpleNamespace(results=[])
         assert provider.prefetch("test") == ""
 
 
-    def test_recall_sync_defaults_off(self, provider):
-        assert provider._recall_sync is False
+    def test_recall_sync_defaults_on(self, provider_with_config):
+        assert provider_with_config()._recall_sync is True
 
     def test_recall_sync_recalls_current_query_synchronously(self, provider_with_config):
-        # recall_sync=True: prefetch() must do a live recall against the
-        # *current* query (not read a previously queued buffer). #5820
         p = provider_with_config(recall_sync=True)
         captured = {}
 
@@ -571,27 +573,106 @@ class TestPrefetch:
 
         p._client.arecall = AsyncMock(side_effect=_capture_recall)
 
-        # Nothing pre-buffered — proves the result comes from a live recall.
-        assert p._prefetch_result == ""
         result = p.prefetch("fix tests")
 
-        assert captured["query"] == "fix tests"       # current query, not ignored
+        assert captured["query"].startswith("CURRENT USER REQUEST:\nfix tests")
         assert "fresh memory" in result
         p._client.arecall.assert_called_once()
 
     def test_recall_sync_skips_background_queue(self, provider_with_config):
-        # With sync recall there's nothing to prime in the background.
         p = provider_with_config(recall_sync=True)
         p.queue_prefetch("anything")
         assert p._prefetch_thread is None
 
-    def test_async_default_ignores_current_query_and_reads_buffer(self, provider):
-        # Default (recall_sync off): prefetch returns the buffered result and
-        # does NOT issue a live recall for the current query.
-        provider._prefetch_result = "- buffered from previous turn"
-        result = provider.prefetch("a totally different current query")
+    def test_legacy_async_mode_ignores_current_query_and_reads_buffer(self, provider_with_config):
+        p = provider_with_config(recall_sync=False)
+        p._prefetch_result = "- buffered from previous turn"
+        result = p.prefetch("a totally different current query")
         assert "buffered from previous turn" in result
-        provider._client.arecall.assert_not_called()
+        p._client.arecall.assert_not_called()
+
+    def test_sync_recall_uses_recent_dialogue_and_preserves_current_intent(
+        self, provider_with_config
+    ):
+        provider = provider_with_config(recall_sync=True)
+        captured = {}
+
+        async def _capture_recall(**kwargs):
+            captured["query"] = kwargs["query"]
+            return SimpleNamespace(results=[SimpleNamespace(text="memory")])
+
+        provider._client.arecall = AsyncMock(side_effect=_capture_recall)
+        provider.prefetch(
+            "Why is it designed that way?",
+            messages=[
+                {"role": "user", "content": "Explain the Hindsight pipeline."},
+                {"role": "assistant", "content": "It used next-turn prefetch."},
+            ],
+        )
+
+        assert captured["query"].startswith(
+            "CURRENT USER REQUEST:\nWhy is it designed that way?"
+        )
+        assert "Explain the Hindsight pipeline." in captured["query"]
+        assert "It used next-turn prefetch." in captured["query"]
+
+    def test_context_compiler_selection_is_injected(self, provider_with_config, monkeypatch):
+        p = provider_with_config(context_compiler=True)
+        p._client.arecall.return_value = SimpleNamespace(
+            results=[SimpleNamespace(text="raw ranked memory", id="mem-1")]
+        )
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.compile_memory_context",
+            lambda **kwargs: CompiledMemoryContext(
+                text="# compiled\nexact selected evidence",
+                count=1,
+                selected_ids=("M0001",),
+            ),
+        )
+
+        result = p.prefetch("current question")
+
+        assert "exact selected evidence" in result
+        assert "raw ranked memory" not in result
+
+    def test_context_compiler_failure_falls_back_to_ranked_exact_evidence(
+        self, provider_with_config, monkeypatch
+    ):
+        p = provider_with_config(context_compiler=True)
+        p._client.arecall.return_value = SimpleNamespace(
+            results=[SimpleNamespace(
+                text="fallback evidence",
+                id="mem-1",
+                document_id="topics/memory.md",
+            )]
+        )
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.compile_memory_context", lambda **kwargs: None
+        )
+
+        result = p.prefetch("current question")
+
+        assert "fallback evidence" in result
+        assert "memory_id=mem-1" in result
+        assert "document=topics/memory.md" in result
+
+    def test_context_compiler_exception_falls_back_to_ranked_exact_evidence(
+        self, provider_with_config, monkeypatch
+    ):
+        p = provider_with_config(context_compiler=True)
+        p._client.arecall.return_value = SimpleNamespace(
+            results=[SimpleNamespace(text="fallback after exception", id="mem-1")]
+        )
+
+        def _raise(**kwargs):
+            raise RuntimeError("compiler unavailable")
+
+        monkeypatch.setattr("plugins.memory.hindsight.compile_memory_context", _raise)
+
+        result = p.prefetch("current question")
+
+        assert "fallback after exception" in result
+        assert "memory_id=mem-1" in result
 
     def test_queue_prefetch_skipped_in_tools_mode(self, provider_with_config):
         p = provider_with_config(memory_mode="tools")
@@ -724,7 +805,9 @@ class TestPrefetchServerRetainVisibility:
     def test_prefetch_proceeds_after_server_wait_timeout(self, provider_with_config):
         """A wedged/never-completing async op must not hang prefetch forever;
         it recalls anyway once the drain budget is exhausted."""
-        p = provider_with_config(prefetch_retain_drain_timeout=0.3)
+        p = provider_with_config(
+            prefetch_retain_drain_timeout=0.3, recall_sync=False
+        )
         order = []
 
         async def _recall(**kwargs):
@@ -751,7 +834,9 @@ class TestPrefetchServerRetainVisibility:
         status endpoint can't make every later prefetch re-burn the full
         timeout on a growing pending set (unbounded session-wide degradation
         + reply-path join penalty)."""
-        p = provider_with_config(prefetch_retain_drain_timeout=0.3)
+        p = provider_with_config(
+            prefetch_retain_drain_timeout=0.3, recall_sync=False
+        )
         p._client = self._client_with_ops(["pending"])  # never completes
         p._client.arecall = AsyncMock(
             return_value=SimpleNamespace(results=[SimpleNamespace(text="m")])
@@ -1322,12 +1407,16 @@ class TestConfigSchema:
             "retain_tags", "retain_source",
             "retain_user_prefix", "retain_assistant_prefix",
             "recall_tags", "recall_tags_match",
-            "auto_recall", "auto_retain",
+            "auto_recall", "recall_sync", "context_compiler", "auto_retain",
             "retain_every_n_turns", "retain_async", "retain_context",
             "recall_max_tokens", "recall_max_input_chars",
             "recall_prompt_preamble",
         }
         assert expected_keys.issubset(keys), f"Missing: {expected_keys - keys}"
+        by_key = {field["key"]: field for field in schema}
+        assert by_key["recall_sync"]["default"] is True
+        assert by_key["context_compiler"]["default"] is False
+        assert by_key["recall_max_input_chars"]["default"] == 4000
 
 
 # ---------------------------------------------------------------------------

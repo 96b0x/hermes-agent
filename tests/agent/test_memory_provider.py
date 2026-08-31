@@ -94,6 +94,19 @@ class MessagesMemoryProvider(FakeMemoryProvider):
         self.synced_turns.append((user_content, assistant_content, session_id, messages))
 
 
+class MessagesPrefetchProvider(FakeMemoryProvider):
+    """Provider that opts into recent-message context during prefetch."""
+
+    def __init__(self, name="messages-prefetch"):
+        super().__init__(name=name)
+        self.prefetch_message_windows = []
+
+    def prefetch(self, query, *, session_id="", messages=None):
+        self.prefetch_queries.append(query)
+        self.prefetch_message_windows.append(messages)
+        return self._prefetch_result
+
+
 class BlockingPrefetchProvider(FakeMemoryProvider):
     """External provider whose prefetch call blocks until released."""
 
@@ -186,6 +199,58 @@ class TestMemoryManager:
         assert p1.prefetch_queries == ["what do you know?"]
         assert p2.prefetch_queries == ["what do you know?"]
 
+    def test_prefetch_passes_bounded_clean_messages_to_opted_in_provider(self):
+        mgr = MemoryManager()
+        provider = MessagesPrefetchProvider("external")
+        provider._prefetch_result = "memory"
+        mgr.add_provider(provider)
+        messages = [
+            {"role": "system", "content": "system must not pass"},
+            {"role": "user", "content": "Earlier question"},
+            {"role": "assistant", "content": "Earlier answer"},
+            {"role": "tool", "content": "tool must not pass"},
+        ]
+
+        result = mgr.prefetch_all("Current question", messages=messages)
+
+        assert result == "memory"
+        assert provider.prefetch_message_windows == [[
+            {"role": "user", "content": "Earlier question"},
+            {"role": "assistant", "content": "Earlier answer"},
+        ]]
+
+    def test_prefetch_message_window_is_character_bounded(self):
+        mgr = MemoryManager()
+        provider = MessagesPrefetchProvider("external")
+        provider._prefetch_result = "memory"
+        mgr.add_provider(provider)
+        messages = [
+            {"role": "user", "content": f"BEGIN-{index}-" + "x" * 5000 + f"-END-{index}"}
+            for index in range(8)
+        ]
+
+        mgr.prefetch_all("Current question", messages=messages)
+
+        window = provider.prefetch_message_windows[0]
+        assert sum(len(message["content"]) for message in window) <= 8000
+        assert window[-1]["content"].startswith("BEGIN-7-")
+        assert window[-1]["content"].endswith("-END-7")
+        assert "prior message truncated" in window[0]["content"]
+
+    def test_prefetch_keeps_legacy_provider_signature_compatible(self):
+        mgr = MemoryManager()
+        provider = FakeMemoryProvider("external")
+        provider._prefetch_result = "legacy memory"
+        mgr.add_provider(provider)
+
+        result = mgr.prefetch_all(
+            "Current question",
+            messages=[{"role": "user", "content": "Earlier question"}],
+        )
+
+        assert result == "legacy memory"
+        assert provider.prefetch_queries == ["Current question"]
+
 
     def test_queue_prefetch_all(self):
         mgr = MemoryManager()
@@ -267,6 +332,23 @@ class TestMemoryManager:
 
     # -- Error resilience ---------------------------------------------------
 
+    def test_external_prefetch_timeout_defaults_to_8_seconds(self):
+        assert MemoryManager()._external_prefetch_timeout == 8.0
+
+    @pytest.mark.parametrize(
+        ("config", "expected"),
+        [
+            ({"provider": "hindsight"}, 45.0),
+            ({"provider": "mem0"}, 8.0),
+            ({"provider": "hindsight", "context_timeout_seconds": 30}, 30.0),
+            ({"provider": "hindsight", "context_timeout_seconds": "invalid"}, 45.0),
+            ({"provider": "mem0", "context_timeout_seconds": float("inf")}, 8.0),
+        ],
+    )
+    def test_memory_context_timeout_is_provider_aware(self, config, expected):
+        from agent.agent_init import _resolve_memory_context_timeout
+
+        assert _resolve_memory_context_timeout(config) == expected
 
     def test_external_prefetch_timeout_skips_stuck_provider(self):
         mgr = MemoryManager(external_prefetch_timeout=0.01)
@@ -845,7 +927,14 @@ class TestMemoryContextFencing:
     """Prefetch context must be wrapped in <memory-context> fence so the model
     does not treat recalled memory as user discourse."""
 
+    def test_context_framing_is_evidence_not_authority(self):
+        from agent.memory_manager import build_memory_context_block
 
+        block = build_memory_context_block("remembered fact")
+
+        assert "stale, incomplete, or conflicting" in block
+        assert "Prefer current user input" in block
+        assert "authoritative reference data" not in block
 
     def test_sanitize_context_strips_fence_escapes(self):
         from agent.memory_manager import sanitize_context

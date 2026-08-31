@@ -71,13 +71,14 @@ Config file: `~/.hermes/hindsight/config.json`
 | `recall_budget` | `mid` | Recall thoroughness: `low` / `mid` / `high` |
 | `recall_prefetch_method` | `recall` | Auto-recall method: `recall` (raw facts) or `reflect` (LLM synthesis) |
 | `recall_max_tokens` | `4096` | Maximum tokens for recall results |
-| `recall_max_input_chars` | `800` | Maximum input query length for auto-recall |
+| `recall_max_input_chars` | `4000` | Maximum current-request plus recent-dialogue query length for auto-recall |
 | `recall_prompt_preamble` | — | Custom preamble for recalled memories in context |
 | `recall_tags` | — | Tags to filter when searching memories |
 | `recall_tags_match` | `any` | Tag matching mode: `any` / `all` / `any_strict` / `all_strict` |
 | `recall_types` | `observation` | Fact types surfaced by recall (both auto-recall and the `hindsight_recall` tool). Comma-separated string or JSON list. **Default narrowed to `observation` only** (see "Behavior change" below). Set to `observation,world,experience` to also include raw facts. |
 | `auto_recall` | `true` | Automatically recall memories before each turn |
-| `recall_sync` | `false` | Recall synchronously against the *current* message each turn (higher relevance, adds recall latency). Default off: recall runs in the background and is injected on the next turn. |
+| `recall_sync` | `true` | Recall synchronously against the current message plus recent dialogue. Set `false` only for legacy next-turn background prefetch. |
+| `context_compiler` | `false` | Use the configured `auxiliary.memory_context` model to select retrieved evidence IDs and arrange current state, relevant memory, prior decisions, conflicts, and deep sources. Invalid output fails open to ranked exact evidence. |
 | `recall_indicator` | `true` | Show a `👁️ Hindsight — recalled N memories` status line when auto-recall injects memory. Turn off for customer-facing agents. |
 
 > **Behavior change — `recall_types` defaults to `observation` only.**
@@ -112,6 +113,31 @@ Config file: `~/.hermes/hindsight/config.json`
 - `hybrid` — automatic context injection + tools available to the LLM
 - `context` — automatic injection only, no tools exposed
 - `tools` — tools only, no automatic injection
+
+Synchronous recall is bounded by the Hermes host timeout. Configure it in
+`~/.hermes/config.yaml` when the Hindsight daemon or reranker takes longer than
+the default 45 seconds:
+
+```yaml
+memory:
+  provider: hindsight
+  context_timeout_seconds: 45
+```
+
+To enable evidence arrangement, configure a fast auxiliary model and set
+`"context_compiler": true` in the Hindsight `config.json`:
+
+```yaml
+auxiliary:
+  memory_context:
+    provider: openrouter
+    model: google/gemini-3.1-flash-lite
+    timeout: 30
+```
+
+The compiler selects opaque candidate IDs only. Hermes validates those IDs and
+renders the original Hindsight text and provenance; compiler failure falls back
+to the native Hindsight ranking.
 
 ### Local Embedded LLM
 

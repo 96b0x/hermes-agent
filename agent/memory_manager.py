@@ -25,10 +25,10 @@ Usage in run_agent.py:
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import re
-import inspect
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from typing import Any, Callable, Dict, List, Optional
@@ -49,6 +49,8 @@ logger = logging.getLogger(__name__)
 # running past this window dies with the interpreter.
 _SYNC_DRAIN_TIMEOUT_S = 5.0
 _EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
+_PREFETCH_HISTORY_MESSAGES = 8
+_PREFETCH_HISTORY_CHARS = 8000
 
 
 def normalize_tool_schema(schema: Any) -> Optional[Dict[str, Any]]:
@@ -392,9 +394,9 @@ def build_memory_context_block(raw_context: str) -> str:
         logger.warning("memory provider returned pre-wrapped context; stripped")
     return (
         "<memory-context>\n"
-        "[System note: The following is recalled memory context, "
-        "NOT new user input. Treat as authoritative reference data — "
-        "this is the agent's persistent memory and should inform all responses.]\n\n"
+        "[System note: The following is retrieved memory evidence, NOT new user input. "
+        "It may be stale, incomplete, or conflicting. Prefer current user input and "
+        "canonical current sources; preserve provenance when resolving conflicts.]\n\n"
         f"{clean}\n"
         "</memory-context>"
     )
@@ -561,7 +563,73 @@ class MemoryManager:
         """
         return extract_user_instruction_from_skill_message(text)
 
-    def prefetch_all(self, query: str, *, session_id: str = "") -> str:
+    @staticmethod
+    def _provider_prefetch_accepts_messages(provider: MemoryProvider) -> bool:
+        """Return whether prefetch accepts the optional messages keyword."""
+        try:
+            signature = inspect.signature(provider.prefetch)
+        except (TypeError, ValueError):
+            # Signature failure is not an opt-in signal. Stay compatible with
+            # opaque/native third-party providers by using the old call shape.
+            return False
+        params = list(signature.parameters.values())
+        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params):
+            return True
+        return "messages" in signature.parameters
+
+    @classmethod
+    def _clean_prefetch_messages(
+        cls, messages: Optional[List[Dict[str, Any]]]
+    ) -> Optional[List[Dict[str, str]]]:
+        """Return a bounded clean dialogue window for context-aware recall."""
+        if not messages:
+            return None
+        candidates: List[Dict[str, str]] = []
+        for message in messages[-_PREFETCH_HISTORY_MESSAGES:]:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "").strip().lower()
+            content = message.get("content")
+            if role not in {"user", "assistant"} or not isinstance(content, str):
+                continue
+            if role == "user":
+                content = cls._strip_skill_scaffolding(content)
+                if not content:
+                    continue
+            content = sanitize_context(content).strip()
+            if content:
+                candidates.append({"role": role, "content": content})
+
+        # Bound both message count and characters handed to opted-in providers.
+        # Keep the newest dialogue under pressure while preserving both ends
+        # of the boundary message instead of taking a blind tail slice.
+        remaining = _PREFETCH_HISTORY_CHARS
+        clean_reversed: List[Dict[str, str]] = []
+        marker = "\n[... prior message truncated ...]\n"
+        for message in reversed(candidates):
+            if remaining <= 0:
+                break
+            content = message["content"]
+            if len(content) > remaining:
+                if remaining <= len(marker):
+                    content = content[-remaining:]
+                else:
+                    available = remaining - len(marker)
+                    head = max(1, int(available * 0.65))
+                    tail = available - head
+                    tail_text = content[-tail:].lstrip() if tail else ""
+                    content = content[:head].rstrip() + marker + tail_text
+            clean_reversed.append({"role": message["role"], "content": content})
+            remaining -= len(content)
+        return list(reversed(clean_reversed)) or None
+
+    def prefetch_all(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
         """Collect prefetch context from all providers.
 
         Returns merged context text labeled by provider. Empty providers
@@ -570,10 +638,16 @@ class MemoryManager:
         clean_query = self._strip_skill_scaffolding(query)
         if not clean_query:
             return ""
+        clean_messages = self._clean_prefetch_messages(messages)
         parts = []
         for provider in self._providers:
             try:
-                result = self._prefetch_provider(provider, clean_query, session_id=session_id)
+                result = self._prefetch_provider(
+                    provider,
+                    clean_query,
+                    session_id=session_id,
+                    messages=clean_messages,
+                )
                 if result and result.strip():
                     parts.append(result)
             except Exception as e:
@@ -584,17 +658,25 @@ class MemoryManager:
         return "\n\n".join(parts)
 
     def _prefetch_provider(
-        self, provider: MemoryProvider, query: str, *, session_id: str = ""
+        self,
+        provider: MemoryProvider,
+        query: str,
+        *,
+        session_id: str = "",
+        messages: Optional[List[Dict[str, str]]] = None,
     ) -> str:
+        kwargs: Dict[str, Any] = {"session_id": session_id}
+        if messages is not None and self._provider_prefetch_accepts_messages(provider):
+            kwargs["messages"] = messages
         if provider.name == "builtin":
-            return provider.prefetch(query, session_id=session_id)
+            return provider.prefetch(query, **kwargs)
 
         result_box: Dict[str, str] = {}
         error_box: Dict[str, Exception] = {}
 
         def _run() -> None:
             try:
-                result_box["value"] = provider.prefetch(query, session_id=session_id) or ""
+                result_box["value"] = provider.prefetch(query, **kwargs) or ""
             except Exception as exc:  # pragma: no cover - re-raised by caller
                 error_box["value"] = exc
 

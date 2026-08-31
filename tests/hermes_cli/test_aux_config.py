@@ -46,8 +46,14 @@ def test_title_generation_present_in_default_config():
     assert tg["extra_body"] == {}
 
 
-
-
+def test_memory_context_present_in_defaults_and_auxiliary_menu():
+    context = DEFAULT_CONFIG["auxiliary"]["memory_context"]
+    assert context["provider"] == "auto"
+    assert context["model"] == ""
+    assert context["timeout"] == 30
+    assert context["reasoning_effort"] == "none"
+    assert DEFAULT_CONFIG["memory"]["context_timeout_seconds"] is None
+    assert any(task[0] == "memory_context" for task in _AUX_TASKS)
 
 
 # ── _format_aux_current ─────────────────────────────────────────────────────

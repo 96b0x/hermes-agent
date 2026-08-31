@@ -43,7 +43,7 @@ import time
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from agent.secret_scope import get_secret
 
@@ -52,6 +52,12 @@ from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
 from tools.registry import tool_error
 from hermes_cli.config import cfg_get
+from plugins.memory.hindsight.context_compiler import (
+    MemoryCandidate,
+    build_recall_query,
+    compile_memory_context,
+    render_ranked_memory_context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +74,95 @@ class _RecallResult:
 
     text: str
     count: int
+    candidates: tuple[MemoryCandidate, ...] = ()
+
+
+def _result_mapping(result: Any) -> Mapping[str, Any]:
+    if isinstance(result, Mapping):
+        return result
+    model_dump = getattr(result, "model_dump", None)
+    if callable(model_dump):
+        try:
+            dumped = model_dump()
+            if isinstance(dumped, Mapping):
+                return dumped
+        except Exception:
+            pass
+    raw = getattr(result, "__dict__", None)
+    return raw if isinstance(raw, Mapping) else {}
+
+
+def _metadata_mapping(value: Any) -> Mapping[str, Any]:
+    if isinstance(value, Mapping):
+        return value
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        try:
+            dumped = model_dump()
+            if isinstance(dumped, Mapping):
+                return dumped
+        except Exception:
+            pass
+    return {}
+
+
+def _display_value(value: Any) -> str:
+    if value is None:
+        return ""
+    isoformat = getattr(value, "isoformat", None)
+    if callable(isoformat):
+        try:
+            return str(isoformat())
+        except Exception:
+            pass
+    return str(value)
+
+
+def _memory_candidate(result: Any, index: int) -> Optional[MemoryCandidate]:
+    data = _result_mapping(result)
+    text = _display_value(data.get("text") or getattr(result, "text", "")).strip()
+    if not text:
+        return None
+    metadata = _metadata_mapping(data.get("metadata") or getattr(result, "metadata", {}))
+    document_id = (
+        data.get("document_id")
+        or getattr(result, "document_id", "")
+        or metadata.get("document_id")
+        or metadata.get("source_path")
+        or ""
+    )
+    memory_id = (
+        data.get("id")
+        or data.get("memory_id")
+        or getattr(result, "id", "")
+        or getattr(result, "memory_id", "")
+        or ""
+    )
+    score = data.get("score")
+    if score is None:
+        score = data.get("relevance_score")
+    if score is None:
+        score = getattr(result, "score", "")
+    return MemoryCandidate(
+        candidate_id=f"M{index:04d}",
+        memory_id=_display_value(memory_id),
+        text=text,
+        memory_type=_display_value(
+            data.get("type") or data.get("fact_type") or getattr(result, "type", "")
+        ),
+        context=_display_value(data.get("context") or getattr(result, "context", "")),
+        occurred_start=_display_value(
+            data.get("occurred_start")
+            or data.get("event_date")
+            or getattr(result, "occurred_start", "")
+        ),
+        mentioned_at=_display_value(
+            data.get("mentioned_at") or getattr(result, "mentioned_at", "")
+        ),
+        document_id=_display_value(document_id),
+        score=_display_value(score),
+        metadata=metadata,
+    )
 
 _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
 _DEFAULT_LOCAL_URL = "http://localhost:8888"
@@ -865,7 +960,10 @@ class HindsightMemoryProvider(MemoryProvider):
 
         # Recall controls
         self._auto_recall = True
-        self._recall_sync = False
+        # Current-turn correctness is the default. Legacy next-turn prefetch is
+        # still available with recall_sync=false for latency-sensitive agents.
+        self._recall_sync = True
+        self._context_compiler = False
         self._recall_max_tokens = 4096
         # Default to observation-only recall. Observations are Hindsight's
         # consolidated knowledge layer — deduplicated, evidence-grounded
@@ -877,7 +975,7 @@ class HindsightMemoryProvider(MemoryProvider):
         # recall via the `recall_types` config key.
         self._recall_types: list[str] = ["observation"]
         self._recall_prompt_preamble = ""
-        self._recall_max_input_chars = 800
+        self._recall_max_input_chars = 4000
 
         # Bank
         self._bank_mission = ""
@@ -1213,7 +1311,8 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_tags_match", "description": "Tag matching mode for recall", "default": "any", "choices": ["any", "all", "any_strict", "all_strict"]},
             {"key": "recall_types", "description": "Fact types to surface on recall — applies to both auto-recall and the hindsight_recall tool (comma-separated or list). Defaults to observation-only — observations are Hindsight's consolidated, deduplicated, evidence-grounded knowledge layer; raw world/experience facts are the supporting evidence observations already summarize. Set to e.g. 'observation,world,experience' to also include raw facts.", "default": "observation"},
             {"key": "auto_recall", "description": "Automatically recall memories before each turn", "default": True},
-            {"key": "recall_sync", "description": "Recall synchronously against the current message before each turn (higher relevance, adds recall latency to the turn). Default off: recall runs in the background and is injected on the next turn.", "default": False},
+            {"key": "recall_sync", "description": "Recall synchronously against the current message plus recent dialogue before each turn. Default on for current-turn correctness; set false for legacy next-turn background prefetch.", "default": True},
+            {"key": "context_compiler", "description": "Use the auxiliary memory_context model to select and arrange recalled evidence IDs. Invalid output fails open to deterministic ranked evidence.", "default": False},
             {"key": "recall_indicator", "description": "Show a '👁️ Hindsight — recalled N memories' status line when auto-recall injects memory (turn off for customer-facing agents)", "default": True},
             {"key": "retain_indicator", "description": "Show a '👁️ Hindsight — saving to memory…' status line when a turn is saved to memory (turn off for customer-facing agents)", "default": True},
             {"key": "auto_retain", "description": "Automatically retain conversation turns", "default": True},
@@ -1223,7 +1322,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "prefetch_retain_drain_timeout", "description": "Max seconds the background prefetch waits for the retain to become recall-visible (queue drain + server-side completion) before recalling anyway", "default": 10.0},
             {"key": "retain_context", "description": "Context label for retained memories", "default": "conversation between Hermes Agent and the User"},
             {"key": "recall_max_tokens", "description": "Maximum tokens for recall results", "default": 4096},
-            {"key": "recall_max_input_chars", "description": "Maximum input query length for auto-recall", "default": 800},
+            {"key": "recall_max_input_chars", "description": "Maximum current-request plus recent-dialogue query length for auto-recall", "default": 4000},
             {"key": "recall_prompt_preamble", "description": "Custom preamble for recalled memories in context"},
             {"key": "timeout", "description": "API request timeout in seconds", "default": _DEFAULT_TIMEOUT},
             {"key": "idle_timeout", "description": "Embedded daemon idle timeout in seconds (0 disables auto-shutdown)", "default": _DEFAULT_IDLE_TIMEOUT, "when": {"mode": "local_embedded"}},
@@ -1721,7 +1820,8 @@ class HindsightMemoryProvider(MemoryProvider):
 
         # Recall controls
         self._auto_recall = self._config.get("auto_recall", True)
-        self._recall_sync = bool(self._config.get("recall_sync", False))
+        self._recall_sync = bool(self._config.get("recall_sync", True))
+        self._context_compiler = bool(self._config.get("context_compiler", False))
         self._recall_max_tokens = int(self._config.get("recall_max_tokens", 4096))
         # Default narrows recall to observation-only; pass an explicit
         # `recall_types` list in config.json to broaden (e.g. include
@@ -1743,7 +1843,7 @@ class HindsightMemoryProvider(MemoryProvider):
         # Companion retain indicator: "👁️ Hindsight — saving to memory…" emitted
         # when a turn is dispatched to the writer. Same off switch rationale.
         self._retain_indicator = bool(self._config.get("retain_indicator", True))
-        self._recall_max_input_chars = int(self._config.get("recall_max_input_chars", 800))
+        self._recall_max_input_chars = int(self._config.get("recall_max_input_chars", 4000))
         self._retain_async = self._config.get("retain_async", True)
         self._prefetch_waits_for_retain = self._config.get("prefetch_waits_for_retain", True)
         self._prefetch_retain_drain_timeout = float(
@@ -1880,7 +1980,7 @@ class HindsightMemoryProvider(MemoryProvider):
         recalled (0 for a reflect synthesis or on error), so the deterministic
         recall indicator can report an accurate count without re-parsing the
         text. Shared by the background prefetch worker (``queue_prefetch``) and
-        the opt-in synchronous path (``prefetch`` when ``recall_sync`` is on).
+        the default synchronous path (``prefetch`` when ``recall_sync`` is on).
         """
         # Truncate query to max chars
         if self._recall_max_input_chars and len(query) > self._recall_max_input_chars:
@@ -1903,10 +2003,15 @@ class HindsightMemoryProvider(MemoryProvider):
             logger.debug("Recall: calling recall (bank=%s, query_len=%d, budget=%s)",
                          self._bank_id, len(query), self._budget)
             resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
-            num_results = len(resp.results) if resp.results else 0
-            logger.debug("Recall: returned %d results", num_results)
-            text = "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
-            return _RecallResult(text, num_results)
+            raw_results = list(resp.results or [])
+            candidates = tuple(
+                candidate
+                for index, result in enumerate(raw_results, start=1)
+                if (candidate := _memory_candidate(result, index)) is not None
+            )
+            logger.debug("Recall: returned %d usable results", len(candidates))
+            text = "\n".join(f"- {candidate.text}" for candidate in candidates)
+            return _RecallResult(text, len(candidates), candidates)
         except Exception as e:
             logger.debug("Hindsight recall failed: %s", e, exc_info=True)
             return _RecallResult("", 0)
@@ -1917,9 +2022,9 @@ class HindsightMemoryProvider(MemoryProvider):
             return ""
         logger.debug("Prefetch: returning %d chars of context", len(result))
         header = self._recall_prompt_preamble or (
-            "# Hindsight Memory (persistent cross-session context)\n"
-            "Use this to answer questions about the user and prior sessions. "
-            "Do not call tools to look up information that is already present here."
+            "# Hindsight Memory Evidence\n"
+            "Retrieved for the current request. It may be stale, incomplete, or "
+            "conflicting; prefer current user input and canonical current sources."
         )
         return f"{header}\n\n{result}"
 
@@ -1932,20 +2037,54 @@ class HindsightMemoryProvider(MemoryProvider):
         self._last_recall_returned = returned
         self._last_recall_count = count if returned else 0
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
-        # Opt-in: recall synchronously against the *current* message so the
-        # injected memories match this turn's query rather than the previous
-        # turn's queued recall. See NousResearch/hermes-agent#5820.
+    def prefetch(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+        messages: Optional[List[Dict[str, str]]] = None,
+    ) -> str:
+        # Default: recall synchronously against the *current* message so the
+        # injected memories match this turn's query rather than a prior turn's
+        # queued recall. See NousResearch/hermes-agent#5820.
         if self._recall_sync:
             if self._recall_disabled():
                 self._record_recall_indicator(returned=False, count=0)
                 return ""
-            recalled = self._do_recall(query)
-            self._record_recall_indicator(returned=bool(recalled.text), count=recalled.count)
-            return self._format_recall(recalled.text)
+            retrieval_query = build_recall_query(
+                query,
+                messages,
+                max_chars=self._recall_max_input_chars,
+            )
+            recalled = self._do_recall(retrieval_query)
+            context_text = recalled.text
+            context_count = recalled.count
+            if recalled.candidates:
+                compiled = None
+                if self._context_compiler:
+                    try:
+                        compiled = compile_memory_context(
+                            current_query=query,
+                            recent_messages=messages,
+                            candidates=recalled.candidates,
+                        )
+                    except Exception as exc:
+                        logger.debug(
+                            "Hindsight context compiler failed open: %s",
+                            type(exc).__name__,
+                        )
+                # Compiler failure is fail-open: inject ranked exact evidence.
+                arranged = compiled or render_ranked_memory_context(recalled.candidates)
+                if arranged is not None:
+                    context_text = arranged.text
+                    context_count = arranged.count
+            self._record_recall_indicator(
+                returned=bool(context_text), count=context_count
+            )
+            return self._format_recall(context_text)
 
-        # Default: return the result the background worker prefetched for the
-        # previous turn (cheap buffer read, capped join).
+        # Legacy latency mode: return the result the background worker
+        # prefetched for the previous turn (cheap buffer read, capped join).
         if self._prefetch_thread and self._prefetch_thread.is_alive():
             logger.debug("Prefetch: waiting for background thread to complete")
             self._prefetch_thread.join(timeout=3.0)

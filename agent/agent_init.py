@@ -20,6 +20,7 @@ preserved.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import sys
@@ -507,6 +508,23 @@ def _normalize_run_budget_seconds(value) -> Optional[float]:
     if seconds != seconds or seconds <= 0:  # NaN or non-positive
         return None
     return seconds
+
+
+def _resolve_memory_context_timeout(mem_config: Optional[Dict[str, Any]]) -> float:
+    """Resolve the fail-open external memory preparation timeout."""
+    config = mem_config or {}
+    provider = str(config.get("provider") or "").strip().lower()
+    default = 45.0 if provider == "hindsight" else 8.0
+    try:
+        value = config.get("context_timeout_seconds")
+        if value is None:
+            return default
+        timeout = float(value)
+        if math.isfinite(timeout) and timeout > 0:
+            return timeout
+    except (TypeError, ValueError):
+        pass
+    return default
 
 
 def _refuse_checkpoint_required_on_codex_app_server(
@@ -1907,7 +1925,9 @@ def init_agent(
             if _mem_provider_name and _mem_provider_name.strip():
                 from agent.memory_manager import MemoryManager as _MemoryManager
                 from plugins.memory import load_memory_provider as _load_mem
-                agent._memory_manager = _MemoryManager()
+                agent._memory_manager = _MemoryManager(
+                    external_prefetch_timeout=_resolve_memory_context_timeout(mem_config)
+                )
                 _mp = _load_mem(_mem_provider_name)
                 if _mp and _mp.is_available():
                     agent._memory_manager.add_provider(_mp)

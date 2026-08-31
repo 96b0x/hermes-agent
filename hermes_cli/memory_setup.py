@@ -423,6 +423,62 @@ def cmd_setup(args) -> None:
     print("\n  Start a new session to activate.\n")
 
 
+def cmd_use(args) -> bool:
+    """Switch the active memory provider without re-running setup.
+
+    Provider setup/configuration and provider-native databases are deliberately
+    left untouched. Only ``memory.provider`` changes, so switching away from a
+    provider and back later resumes the same persisted state.
+
+    Returns ``True`` when the selector was saved and ``False`` when validation
+    rejected the requested provider.
+    """
+    from hermes_cli.config import load_config, save_config
+
+    requested = str(getattr(args, "provider", "") or "").strip().lower()
+    builtin_aliases = {"builtin", "built-in", "none", "off"}
+
+    config = load_config()
+    if not isinstance(config.get("memory"), dict):
+        config["memory"] = {}
+
+    if requested in builtin_aliases:
+        config["memory"]["provider"] = ""
+        save_config(config)
+        print("\n  ✓ Memory provider: built-in only")
+        print("  External provider configuration and state were preserved.")
+        print("  Start a new session to activate.\n")
+        return True
+
+    providers = {name: provider for name, _, provider in _get_available_providers()}
+    provider = providers.get(requested)
+    if provider is None:
+        print(f"\n  Memory provider '{requested}' not found.")
+        print("  Run 'hermes memory status' to see installed providers.\n")
+        return False
+
+    available = False
+    try:
+        available = bool(provider.is_available())
+    except Exception:
+        pass
+    if not available and not bool(getattr(args, "force", False)):
+        print(f"\n  Memory provider '{requested}' is installed but not currently available.")
+        print(f"  Configure it with: hermes memory setup {requested}")
+        print(
+            f"  Or activate the saved selector anyway: "
+            f"hermes memory use {requested} --force\n"
+        )
+        return False
+
+    config["memory"]["provider"] = requested
+    save_config(config)
+    print(f"\n  ✓ Memory provider: {requested}")
+    print("  Other provider configuration and state were preserved.")
+    print("  Start a new session to activate.\n")
+    return True
+
+
 def _write_env_vars(
     env_writes: dict,
     hermes_home: str | os.PathLike[str] | None = None,
@@ -579,6 +635,8 @@ def memory_command(args) -> None:
             cmd_setup_provider(provider)
         else:
             cmd_setup(args)
+    elif sub == "use":
+        cmd_use(args)
     elif sub == "status":
         cmd_status(args)
     else:

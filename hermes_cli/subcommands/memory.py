@@ -15,7 +15,7 @@ def build_memory_parser(subparsers, *, cmd_memory: Callable) -> None:
         "memory",
         help="Configure external memory provider",
         description=(
-            "Set up and manage external memory provider plugins.\n\n"
+            "Set up, switch, and manage external memory provider plugins.\n\n"
             "Available providers: honcho, openviking, mem0, hindsight,\n"
             "holographic, retaindb, byterover.\n\n"
             "Only one external provider can be active at a time.\n"
@@ -31,6 +31,19 @@ def build_memory_parser(subparsers, *, cmd_memory: Callable) -> None:
         nargs="?",
         default=None,
         help="Provider to configure directly (e.g. honcho), skipping the picker",
+    )
+    _use_parser = memory_sub.add_parser(
+        "use",
+        help="Switch to an already-configured provider without deleting other provider state",
+    )
+    _use_parser.add_argument(
+        "provider",
+        help="Provider name, or 'builtin' for MEMORY.md / USER.md only",
+    )
+    _use_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Activate an installed provider even when its requirements are not currently available",
     )
     memory_sub.add_parser("status", help="Show current memory provider config")
     memory_sub.add_parser("off", help="Disable external provider (built-in only)")

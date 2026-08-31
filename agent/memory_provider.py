@@ -175,7 +175,13 @@ class MemoryProvider(ABC):
         """
         return ""
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
+    def prefetch(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+        messages: Optional[List[Dict[str, str]]] = None,
+    ) -> str:
         """Recall relevant context for the upcoming turn.
 
         Called before each API call. Return formatted text to inject as
@@ -186,6 +192,11 @@ class MemoryProvider(ABC):
         session_id is provided for providers serving concurrent sessions
         (gateway group chats, cached agents). Providers that don't need
         per-session scoping can ignore it.
+
+        ``messages`` is an optional bounded, clean user/assistant dialogue
+        window preceding the current query. MemoryManager only passes it to
+        providers whose signature opts in, preserving compatibility with
+        third-party providers written against the historical contract.
         """
         return ""
 

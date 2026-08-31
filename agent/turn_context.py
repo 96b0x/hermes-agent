@@ -1477,7 +1477,11 @@ def build_turn_context(
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
             if not is_trivial_prompt(_query):
-                ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
+                ext_prefetch_cache = agent._memory_manager.prefetch_all(
+                    _query,
+                    session_id=agent.session_id,
+                    messages=messages[:current_turn_user_idx],
+                ) or ""
         except Exception:
             pass
         # Deterministic, model-independent recall indicator: when memory was

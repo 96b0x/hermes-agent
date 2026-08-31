@@ -13,8 +13,15 @@ Hermes Agent ships with 8 external memory provider plugins that give the agent p
 ```bash
 hermes memory setup      # interactive picker + configuration
 hermes memory status     # check what's active
+hermes memory use mem0   # reactivate an already-configured provider
+hermes memory use builtin # built-in only; external state stays intact
 hermes memory off        # disable external provider
 ```
+
+Switching with `hermes memory use` changes only the active-provider selector.
+Each provider's native configuration and persisted database remain untouched,
+so you can switch away and later resume the same state. Start a new session
+after switching; provider tools and prompt context are fixed for a conversation.
 
 You can also select the active memory provider via `hermes plugins` → Provider Plugins → Memory Provider.
 
@@ -30,7 +37,7 @@ memory:
 When a memory provider is active, Hermes automatically:
 
 1. **Injects provider context** into the system prompt (what the provider knows)
-2. **Prefetches relevant memories** before each turn (background, non-blocking)
+2. **Prepares relevant memories** before each turn (synchronous current-turn recall by default for Hindsight; provider-specific elsewhere)
 3. **Syncs conversation turns** to the provider after each response
 4. **Extracts memories on session end** (for providers that support it)
 5. **Mirrors built-in memory writes** to the external provider
@@ -449,6 +456,9 @@ The setup wizard installs dependencies automatically and only installs what's ne
 | `memory_mode` | `hybrid` | `hybrid` (context + tools), `context` (auto-inject only), `tools` (tools only) |
 | `auto_retain` | `true` | Automatically retain conversation turns |
 | `auto_recall` | `true` | Automatically recall memories before each turn |
+| `recall_sync` | `true` | Recall against the current message plus recent dialogue before the frontier model runs. Set `false` for legacy next-turn background prefetch. |
+| `context_compiler` | `false` | Arrange retrieved evidence with `auxiliary.memory_context`; invalid output falls back to native ranked evidence. |
+| `recall_max_input_chars` | `4000` | Maximum current-request plus recent-dialogue retrieval query length |
 | `retain_async` | `true` | Process retain asynchronously on the server |
 | `retain_context` | `conversation between Hermes Agent and the User` | Context label for retained memories |
 | `retain_tags` | — | Default tags applied to retained memories; merged with per-call tool tags |
@@ -456,6 +466,24 @@ The setup wizard installs dependencies automatically and only installs what's ne
 | `retain_user_prefix` | `User` | Label used before user turns in auto-retained transcripts |
 | `retain_assistant_prefix` | `Assistant` | Label used before assistant turns in auto-retained transcripts |
 | `recall_tags` | — | Tags to filter on recall |
+
+For slower local retrieval/reranking, raise the fail-open host timeout:
+
+```yaml
+memory:
+  provider: hindsight
+  context_timeout_seconds: 45
+```
+
+The optional context compiler is configured as an auxiliary task, for example:
+
+```yaml
+auxiliary:
+  memory_context:
+    provider: openrouter
+    model: google/gemini-3.1-flash-lite
+    timeout: 30
+```
 
 See [plugin README](https://github.com/NousResearch/hermes-agent/blob/main/plugins/memory/hindsight/README.md) for the full configuration reference.
 

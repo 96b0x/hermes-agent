@@ -1230,6 +1230,17 @@ DEFAULT_CONFIG = {
             "timeout": 8,
             "extra_body": {},
         },
+        # Current-turn memory context compiler. The model may select and
+        # classify retrieved evidence IDs but must not synthesize memory facts.
+        "memory_context": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 30,
+            "extra_body": {},
+            "reasoning_effort": "none",
+        },
         "tts_audio_tags": {
             "provider": "auto",
             "model": "",
@@ -2063,6 +2074,9 @@ DEFAULT_CONFIG = {
         # "hindsight", "holographic", "retaindb", "byterover".
         # Only ONE external provider is allowed at a time.
         "provider": "",
+        # Optional fail-open wall-clock bound for synchronous external context
+        # preparation. Defaults to 45s for Hindsight and 8s for other providers.
+        "context_timeout_seconds": None,
     },
 
     # Subagent delegation — override the provider:model used by delegate_task

@@ -1346,7 +1346,8 @@ Subcommands:
 
 | Subcommand | Description |
 |------------|-------------|
-| `setup` | Interactive provider selection and configuration. |
+| `setup [provider]` | Interactive provider selection and configuration, or configure one provider directly. |
+| `use <provider\|builtin> [--force]` | Switch to an already-configured provider while preserving every provider's persisted state. Starts on the next session. |
 | `status` | Show current memory provider config. |
 | `off` | Disable external provider (built-in only). |
 
